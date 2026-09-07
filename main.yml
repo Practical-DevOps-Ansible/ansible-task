@@ -1,1 +1,92 @@
 ---
+- name: Setup MariaDB
+  hosts: db
+  become: true
+  tasks:
+    - name: Install MariaDB and dependencies
+      apt:
+        name: [mariadb-server, python3-pymysql]
+        state: present
+        update_cache: yes
+
+    - name: Enable remote connections
+      lineinfile:
+        path: /etc/mysql/mariadb.conf.d/50-server.cnf
+        regexp: '^bind-address'
+        line: 'bind-address = 0.0.0.0'
+      register: db_conf
+
+    - name: Restart MariaDB if config changed
+      service:
+        name: mariadb
+        state: restarted
+      when: db_conf.changed
+
+    - name: Create db and user
+      community.mysql.mysql_db:
+        name: "{{ db_name }}"
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+    
+    - name: Create user
+      community.mysql.mysql_user:
+        name: "{{ db_user }}"
+        password: "{{ db_pass }}"
+        priv: "{{ db_name }}.*:ALL"
+        host: "%"
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+
+- name: Setup Laravel Web App
+  hosts: server
+  become: true
+  vars:
+    app_path: /var/www/app-for-devops
+  tasks:
+    - name: Install web dependencies
+      apt:
+        name: [apache2, php, libapache2-mod-php, php-mysql, php-xml, php-mbstring, php-curl, git, composer]
+        state: present
+        update_cache: yes
+
+    - name: Enable mod_rewrite
+      apache2_module:
+        name: rewrite
+        state: present
+
+    - name: Clone Laravel repo
+      git:
+        repo: https://github.com/Practical-DevOps/app-for-devops.git
+        dest: "{{ app_path }}"
+        force: yes
+
+    - name: Setup .env and app
+      shell: |
+        cp -n .env.example .env
+        sed -i 's/^DB_CONNECTION=.*/DB_CONNECTION=mysql/' .env
+        sed -i 's/^DB_HOST=.*/DB_HOST={{ db_host }}/' .env
+        sed -i 's/^DB_DATABASE=.*/DB_DATABASE={{ db_name }}/' .env
+        sed -i 's/^DB_USERNAME=.*/DB_USERNAME={{ db_user }}/' .env
+        sed -i 's/^DB_PASSWORD=.*/DB_PASSWORD={{ db_pass }}/' .env
+        COMPOSER_ALLOW_SUPERUSER=1 composer install --no-interaction
+        php artisan key:generate --force
+        php artisan migrate --force
+        chown -R www-data:www-data {{ app_path }}
+        chmod -R 775 {{ app_path }}/storage {{ app_path }}/bootstrap/cache
+      args:
+        chdir: "{{ app_path }}"
+
+    - name: Configure Apache vhost
+      copy:
+        dest: /etc/apache2/sites-available/000-default.conf
+        content: |
+          <VirtualHost *:80>
+              DocumentRoot {{ app_path }}/public
+              <Directory {{ app_path }}/public>
+                  AllowOverride All
+                  Require all granted
+              </Directory>
+          </VirtualHost>
+
+    - name: Restart Apache
+      service:
+        name: apache2
+        state: restarted
